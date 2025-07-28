@@ -4,7 +4,7 @@ import sys
 import logging
 import fitz  # PyMuPDF
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
 import config
@@ -29,7 +29,8 @@ except LookupError:
     sys.exit(1)
 
 # --- PyTorch Thread Management ---
-torch.set_num_threads(max(1, cpu_count() - 1))
+# Performance: Control threads to prevent over-subscription on CPU.
+torch.set_num_threads(config.PYTORCH_NUM_THREADS)
 
 # --- Constants ---
 ROOT_DATA_PATH = os.getenv("ROOT_DATA_PATH", "/app/data")
@@ -58,18 +59,22 @@ def _detect_headers_footers(doc):
     if page_count < 3:
         return headers_footers
     candidate_texts = {}
-    for page in doc:
+    # Sample first, middle, and last pages for efficiency in very long docs
+    pages_to_check = [doc[0], doc[page_count // 2], doc[-1]]
+    for page in pages_to_check:
         page_height = page.rect.height
-        top_rect = fitz.Rect(0, 0, page.rect.width, page_height * 0.15)
-        bottom_rect = fitz.Rect(0, page_height * 0.85, page.rect.width, page_height)
+        # Check 10% margins
+        top_rect = fitz.Rect(0, 0, page.rect.width, page_height * 0.10)
+        bottom_rect = fitz.Rect(0, page_height * 0.90, page.rect.width, page_height)
         for text in (
             page.get_textbox(top_rect).strip(),
             page.get_textbox(bottom_rect).strip(),
         ):
-            if text:
+            if text and len(text) > 5:
                 candidate_texts[text] = candidate_texts.get(text, 0) + 1
+    # Identify text that appears on more than half the checked pages
     for text, count in candidate_texts.items():
-        if count > page_count / 2:
+        if count > len(pages_to_check) / 2:
             headers_footers.add(text)
     return headers_footers
 
@@ -106,13 +111,25 @@ def extract_sections_from_pdf(pdf_path):
             body_size = Counter(font_sizes).most_common(1)[0][0]
             current_title, content_buffer = f"Page {page_num + 1} Content", ""
             for block in blocks:
-                block_text = "".join(
+                is_header_or_footer = False
+                block_text_unprocessed = "".join(
                     s["text"]
                     for l in block.get("lines", [])
                     for s in l.get("spans", [])
                 ).strip()
-                if block_text in headers_footers:
+
+                if not block_text_unprocessed:
                     continue
+
+                # Check if the whole block text is a header/footer
+                for hf in headers_footers:
+                    if hf in block_text_unprocessed:
+                        is_header_or_footer = True
+                        break
+                if is_header_or_footer:
+                    continue
+
+                block_text = ""
                 for line in block.get("lines", []):
                     spans = line.get("spans", [])
                     if not spans:
@@ -120,12 +137,14 @@ def extract_sections_from_pdf(pdf_path):
                     text = "".join(s["text"] for s in spans).strip()
                     if not text:
                         continue
+
                     span = spans[0]
                     is_style = (span["flags"] & 16) or (
-                        span["size"] > body_size + config.HEADING_FONT_SIZE_THRESHOLD
+                        span["size"] > body_size * config.HEADING_FONT_SIZE_THRESHOLD
                     )
                     is_structural = HEADING_PATTERN.match(text) is not None
                     is_heading = (is_style or is_structural) and len(text.split()) < 12
+
                     if is_heading:
                         if content_buffer.strip():
                             sections.append(
@@ -139,6 +158,7 @@ def extract_sections_from_pdf(pdf_path):
                         current_title, content_buffer = text, ""
                     else:
                         content_buffer += text + "\n"
+
             if content_buffer.strip():
                 sections.append(
                     {
@@ -156,27 +176,65 @@ def extract_sections_from_pdf(pdf_path):
     return sections
 
 
-def get_refined_text_semantic_optimized(content, query_embedding):
-    try:
-        sentences = nltk.sent_tokenize(content)
-    except Exception:
-        sentences = content.split(".")
+def get_refined_text_batch(top_sections, query_embedding):
+    """
+    Performance: Processes all top sections in a single batch for efficiency.
+    """
+    all_chunks = []
+    section_chunk_map = defaultdict(list)
 
-    if len(sentences) <= config.SENTENCES_PER_CHUNK:
-        return " ".join(sentences)
+    for i, section in enumerate(top_sections):
+        content = section["content"]
+        try:
+            sentences = nltk.sent_tokenize(content)
+        except Exception:
+            sentences = content.split(".")
 
-    # FIX: Corrected the range logic to ensure all sentences are included in chunks.
-    step = max(1, config.SENTENCES_PER_CHUNK - config.CHUNK_OVERLAP)
-    chunks = [
-        " ".join(sentences[i : i + config.SENTENCES_PER_CHUNK])
-        for i in range(0, len(sentences), step)
+        if len(sentences) <= config.SENTENCES_PER_CHUNK:
+            section_chunk_map[i].append(" ".join(sentences))
+            continue
+
+        step = max(1, config.SENTENCES_PER_CHUNK - config.CHUNK_OVERLAP)
+        chunks = [
+            " ".join(sentences[j : j + config.SENTENCES_PER_CHUNK])
+            for j in range(0, len(sentences), step)
+        ]
+        if chunks:
+            section_chunk_map[i].extend(chunks)
+
+    # Flatten all chunks from all sections into one list for batch encoding
+    master_chunk_list = [
+        chunk for chunks in section_chunk_map.values() for chunk in chunks
     ]
 
-    if not chunks:
-        return " ".join(sentences[: config.SENTENCES_PER_CHUNK])
+    if not master_chunk_list:
+        return ["No relevant text found." for _ in top_sections]
 
-    embeddings = model.encode(chunks, convert_to_tensor=True, batch_size=32)
-    return chunks[util.pytorch_cos_sim(query_embedding, embeddings)[0].argmax()]
+    # Perform one single, large batch encoding operation
+    chunk_embeddings = model.encode(
+        master_chunk_list, convert_to_tensor=True, batch_size=128
+    )
+
+    # Calculate similarities and find the best chunk for each section
+    refined_texts = []
+    chunk_offset = 0
+    for i in range(len(top_sections)):
+        num_chunks = len(section_chunk_map[i])
+        if num_chunks == 0:
+            refined_texts.append("Content too short to refine.")
+            continue
+
+        # Get the slice of embeddings corresponding to the current section's chunks
+        section_embeddings = chunk_embeddings[chunk_offset : chunk_offset + num_chunks]
+
+        # Find the best chunk
+        cos_scores = util.pytorch_cos_sim(query_embedding, section_embeddings)[0]
+        best_chunk_index = cos_scores.argmax()
+
+        refined_texts.append(section_chunk_map[i][best_chunk_index])
+        chunk_offset += num_chunks
+
+    return refined_texts
 
 
 def extract_keywords_from_persona(persona, job_to_be_done):
@@ -195,14 +253,18 @@ def analyze_documents(docs, persona, job, pdf_dir):
         return [], []
 
     keywords = extract_keywords_from_persona(persona, job)
+    # Performance: Pre-compile regex for faster matching.
     keyword_pattern = re.compile(
         r"\b(" + "|".join(map(re.escape, keywords)) + r")\b", re.IGNORECASE
     )
 
     candidate_sections = []
+    # Performance: Use multiprocessing for I/O-bound PDF parsing.
     with Pool(min(cpu_count(), len(pdf_paths))) as pool:
+        # Use imap_unordered for memory efficiency
         for sections in pool.imap_unordered(extract_sections_from_pdf, pdf_paths):
             for section in sections:
+                # Performance: Pre-filter sections to reduce semantic search space.
                 if keyword_pattern.search(
                     section["section_title"]
                 ) or keyword_pattern.search(section["content"]):
@@ -212,10 +274,12 @@ def analyze_documents(docs, persona, job, pdf_dir):
         return [], []
 
     query_embedding = model.encode(job.get("task", ""), convert_to_tensor=True)
-    texts_for_embedding = [
+    # Performance: Create text for embedding as a generator to save memory.
+    texts_for_embedding = (
         f"{s['section_title']}. {' '.join(s['content'].split()[:250])}"
         for s in candidate_sections
-    ]
+    )
+    # Performance: Encode all candidate sections in a single batch operation.
     embeddings = model.encode(
         texts_for_embedding, convert_to_tensor=True, batch_size=128
     )
@@ -245,8 +309,14 @@ def analyze_documents(docs, persona, job, pdf_dir):
         : config.TOP_N_SECTIONS
     ]
 
+    if not top_sections:
+        return [], []
+
     for rank, section in enumerate(top_sections, 1):
         section["importance_rank"] = rank
+
+    # Performance: Generate all refined texts in a single batch operation.
+    refined_texts_list = get_refined_text_batch(top_sections, query_embedding)
 
     extracted = [
         {k: v for k, v in s.items() if k not in ("score", "content")}
@@ -255,12 +325,10 @@ def analyze_documents(docs, persona, job, pdf_dir):
     analysis = [
         {
             "document": s["document"],
-            "refined_text": get_refined_text_semantic_optimized(
-                s["content"], query_embedding
-            ),
+            "refined_text": refined_texts_list[i],
             "page_number": s["page_number"],
         }
-        for s in top_sections
+        for i, s in enumerate(top_sections)
     ]
     return extracted, analysis
 
@@ -295,9 +363,12 @@ def process_collection(collection_path):
         if not all(k in data for k in ("documents", "persona", "job_to_be_done")):
             logger.error(f"Invalid JSON in {input_json}.")
             return
+
+        logger.info(f"Analyzing documents for collection: {collection_path}")
         extracted, analysis = analyze_documents(
             data["documents"], data["persona"], data["job_to_be_done"], pdf_dir
         )
+
         with open(output_json, "w") as f:
             json.dump(generate_final_output(data, extracted, analysis), f, indent=4)
         logger.info(f"Successfully processed collection: {collection_path}")

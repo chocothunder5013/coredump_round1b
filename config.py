@@ -4,6 +4,13 @@
 # and loaded from during runtime.
 LOCAL_MODEL_PATH = "./model"
 
+# Performance: Explicitly set the number of threads for PyTorch.
+# This prevents the model from consuming all CPU resources.
+# It is set to one less than total CPUs in the original solution.
+# Making it configurable allows for fine-tuning in different environments.
+import os
+PYTORCH_NUM_THREADS = max(1, os.cpu_count() - 1)
+
 # Weights for combining keyword and semantic scores. Must sum to 1.0.
 # A higher semantic weight favors contextual relevance over direct keyword matches.
 KEYWORD_SCORE_WEIGHT = 0.4

@@ -1,9 +1,10 @@
 # List of Python dependencies required for the project.
+# Versions are pinned to ensure build stability and reproducibility.
 
-nltk>=3.9.1
-PyMuPDF>=1.24.1
-sentence-transformers>=2.7.0
+nltk==3.8.1
+PyMuPDF==1.24.1
+sentence-transformers==2.7.0
 
 # torch is the core dependency for sentence-transformers.
 # torchvision is excluded as it's not used and adds significant size.
-torch>=2.3.0
+torch==2.3.0
